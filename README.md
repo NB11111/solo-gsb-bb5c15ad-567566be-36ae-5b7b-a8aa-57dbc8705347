@@ -204,6 +204,83 @@ RFC 6901 路径字符串排序并对齐两侧叶子：
 文档时（例如以相同值 `replace`），`changedPaths` 为空数组；`operations` 为空数组
 时原样返回文档且 `changedPaths` 为 `[]`。
 
+### 9. 确定性叶路径脱敏（`POST /redact`）
+
+`/redact` 接收一份 `document` 与一组 `rules`，在文档的**深拷贝**上按规则对
+**RFC 6901 叶路径**（与 `/commit`、`/diff` 相同的叶模型：标量、`null`、
+空对象 `{}`、空数组 `[]` 都是叶子，因此**空对象和空数组也可以被脱敏**）执行
+确定性脱敏：
+
+```json
+{ "pattern": "/subject/name", "action": "mask", "value": "***" }
+{ "pattern": "/emails/*",      "action": "drop" }
+{ "pattern": "/subject/**",    "action": "mask", "value": "[redacted]" }
+```
+
+`pattern` 是 RFC 6901 片段（`~0`/`~1` 转义规则相同），其引用记号（reference token）
+支持三种形式：
+
+| 记号 | 含义 |
+| --- | --- |
+| 字面量（如 `subject`、`0`） | 与同位置的记号精确相等（数组下标就是普通字面量记号） |
+| `*` | 匹配**恰好一层**：任意对象成员名或数组下标 |
+| `**` | 匹配**任意层（含 0 层）**：可出现在任意位置 |
+
+要点：
+
+- 非空对象/数组不是叶子，不会被模式匹配；`**` 不会命中中间的非空容器，只会命中其
+  叶后代；
+- `/a/**` 既匹配 `/a` 本身（`/a` 是叶时，`**` 消费 0 个记号），也匹配其任意深度的
+  叶后代；`/**` 匹配文档内所有叶（含根叶），裸 `**` / `*` 不以 `/` 开头，属于
+  `POINTER_SYNTAX`；
+- 空指针 `""` 只匹配整文档这一根叶（根标量、根 `{}`、根 `[]`）；
+- `*`/`**` 的判定发生在 RFC 6901 反转义之后，因此名字恰好叫 `*` 或 `**` 的对象成员
+  无法用通配模式表达（其他接口仍可用精确指针访问）。
+
+`action`：
+
+| action | 对象成员 | 数组元素 |
+| --- | --- | --- |
+| `mask` | 把叶值替换为规则的常量 `value`（**必填**，任意 JSON 值，每个命中点深拷贝一份） | 同左 |
+| `drop` | **移除该成员** | **置为 `null`**（保留下标、不移动后续元素） |
+
+根叶（空指针或 `/**` 命中）被 `drop` 时没有父容器可删除，整个文档变为 JSON `null`。
+`drop` 不需要 `value`（多余字段忽略）。
+
+**同一叶被多条规则命中时按如下确定性优先级选一条生效规则：**
+
+1. 字面量记号**数量更多**的规则胜出；
+2. 并列时 `*` 记号数量更多的规则胜出（等价于 `**` 更少）；
+3. 仍并列时按规则在 `rules` 数组中的**先后顺序**，先者胜。
+
+规则先全部解析并校验（类型、`action`、模式语法、mask 必填 `value`），**再整体生效**：
+任一模式非法时整份请求失败，不返回部分脱敏结果。模式语法错误使用统一错误码
+`POINTER_SYNTAX`，`loc` 精确定位到 `rules[i].pattern`；结构字段错误为
+`INVALID_REQUEST`，定位到 `rules[i]`（或 `.action` / `.value`）。
+
+成功响应：
+
+```json
+{
+  "document": { …脱敏后的文档… },
+  "applied": [
+    { "path": "/emails/0", "action": "drop",   "rule": 1 },
+    { "path": "/emails/1", "action": "drop",   "rule": 1 },
+    { "path": "/subject/age",  "action": "mask", "rule": 2 },
+    { "path": "/subject/name", "action": "mask", "rule": 0 }
+  ]
+}
+```
+
+`applied` 每项给出被脱敏叶的 `path`、生效 `action` 与生效规则下标 `rule`
+（从 0 开始，便于核对多规则竞争结果），并按 RFC 6901 指针字符串排序。
+没有任何模式命中叶时 `document` 原样返回、`applied` 为 `[]`；`rules: []`
+是合法的空操作。
+
+注意：被匹配的叶子互为反链（一个叶不可能是另一个叶的祖先），各条脱敏互不影响路径，
+因此结果与执行顺序无关；`drop` 掉容器内全部成员后，中间容器以空壳 `{}`/`[]` 保留
+（它原本不是叶子，规则并未直接作用于它）。
+
 ## API
 
 所有请求/响应均为 JSON。错误响应统一形如：
@@ -415,6 +492,56 @@ RFC 6901 路径字符串排序并对齐两侧叶子：
 } }
 ```
 
+### `POST /redact` — 确定性叶路径脱敏
+
+请求（`pattern` 支持字面量、`*` 一层、`**` 任意层；`mask` 必须携带 `value`）：
+
+```json
+{
+  "document": {
+    "subject": { "name": "Ada Lovelace", "age": 36, "secret": "x" },
+    "emails": ["ada@example.com", "ada@analytical.engine"],
+    "empty": {}
+  },
+  "rules": [
+    { "pattern": "/subject/name", "action": "mask", "value": "***" },
+    { "pattern": "/emails/*", "action": "drop" },
+    { "pattern": "/subject/**", "action": "mask", "value": "[redacted]" }
+  ]
+}
+```
+
+成功（`200`）——`/subject/name` 命中规则 0 与 2，字面量更多的规则 0 胜出；
+`/subject/age`、`/subject/secret` 由规则 2 掩码；数组元素被置为 `null` 而非移除：
+
+```json
+{
+  "document": {
+    "subject": { "name": "***", "age": "[redacted]", "secret": "[redacted]" },
+    "emails": [null, null],
+    "empty": {}
+  },
+  "applied": [
+    { "path": "/emails/0", "action": "drop", "rule": 1 },
+    { "path": "/emails/1", "action": "drop", "rule": 1 },
+    { "path": "/subject/age", "action": "mask", "rule": 2 },
+    { "path": "/subject/name", "action": "mask", "rule": 0 },
+    { "path": "/subject/secret", "action": "mask", "rule": 2 }
+  ]
+}
+```
+
+非法模式沿用统一错误格式（`loc` 定位到具体规则的模式字段）：
+
+```json
+{ "error": {
+    "code": "POINTER_SYNTAX",
+    "message": "invalid escape sequence in token 'bad~x': '~' must be followed by '0' or '1'",
+    "loc": "rules[1].pattern",
+    "detail": { "pattern": "/bad~x" }
+} }
+```
+
 ### `POST /verify` — 无原文校验
 
 请求体只需提交方给你的根与所选披露：
@@ -485,8 +612,8 @@ RFC 6901 路径字符串排序并对齐两侧叶子：
 | HTTP | code | 触发场景（示例） |
 | --- | --- | --- |
 | 400 | `INVALID_JSON` | 请求体不是合法 JSON、含重复对象键 |
-| 400 | `INVALID_REQUEST` | 缺字段、类型错误 |
-| 400 | `POINTER_SYNTAX` | 指针非法（如尾随 `~`、不以 `/` 开头） |
+| 400 | `INVALID_REQUEST` | 缺字段、类型错误（含 `/redact` 规则缺 `pattern`/`action`/`value`、非法 `action`） |
+| 400 | `POINTER_SYNTAX` | 指针非法（如尾随 `~`、不以 `/` 开头；含 `/redact` 的非法模式，`loc` 为 `rules[i].pattern`） |
 | 400 | `PATH_NOT_FOUND` | 文档中不存在该路径（含数组越界、`remove`/`replace` 命中不存在的成员、对 `-` 做非 `add` 操作等） |
 | 400 | `PATH_NOT_LEAF` | 路径是非空容器（`/commit` 的 `reveal` 或 `/diff` 的 `paths`）；`detail.leafChildren` 给出可选的叶路径 |
 | 400 | `DUPLICATE_PATH` | 同一指针重复提交 |
@@ -502,6 +629,7 @@ RFC 6901 路径字符串排序并对齐两侧叶子：
 - `GET /healthz` → `{"status":"ok"}`
 - `POST /diff` → 叶级 added/removed/changed 变更报告
 - `POST /patch` → 顺序执行 RFC 6902 add/remove/replace 补丁，返回 patched 文档与 changedPaths
+- `POST /redact` → 按字面量/`*`/`**` 模式对叶路径执行 mask/drop 确定性脱敏，返回脱敏文档与按路径排序的 applied
 - `GET /` → 服务与端点元信息
 - `GET /docs` / `GET /openapi.json` → OpenAPI 文档
 
@@ -537,6 +665,21 @@ curl -s localhost:8000/patch -H 'content-type: application/json' -d '{
   ]
 }'
 
+# 4c) 确定性脱敏：字面量优先于 *、* 优先于 **，同优先级按规则顺序；
+#     mask 替换为常量，drop 删成员 / 把数组元素置 null
+curl -s localhost:8000/redact -H 'content-type: application/json' -d '{
+  "document": {"subject": {"name": "Ada", "age": 36}, "emails": ["a@x", "b@y"]},
+  "rules": [
+    {"pattern": "/subject/name", "action": "mask", "value": "***"},
+    {"pattern": "/emails/*", "action": "drop"},
+    {"pattern": "/subject/**", "action": "mask", "value": "[redacted]"}
+  ]
+}'
+# => {"document": {"subject": {"name": "***", "age": "[redacted]"},
+#                  "emails": [null, null]},
+#     "applied": ["/emails/0" drop, "/emails/1" drop,
+#                 "/subject/age" mask(rule 2), "/subject/name" mask(rule 0)]}
+
 # 5) 紧凑多叶证明：加 "proofMode": "compact"，返回 leafCount、
 #    每个叶的 index，以及按 (level,index) 去重的 proofNodes
 curl -s localhost:8000/commit -H 'content-type: application/json' -d '{
@@ -552,7 +695,7 @@ curl -s localhost:8000/commit -H 'content-type: application/json' -d '{
 
 ```bash
 python3 -m pip install -r requirements-dev.txt
-python3 -m pytest -q          # 120+ 个测试
+python3 -m pytest -q          # 170+ 个测试
 python3 -m uvicorn app.main:app --reload --port 8000
 ```
 
@@ -560,9 +703,10 @@ python3 -m uvicorn app.main:app --reload --port 8000
 
 ```
 app/
-  main.py        # FastAPI 路由：/commit、/verify、/diff、/patch、错误处理
+  main.py        # FastAPI 路由：/commit、/verify、/diff、/patch、/redact、错误处理
   diff.py        # 叶级路径对齐、规范值指纹与 added/removed/changed
   patch.py       # RFC 6902 add/remove/replace 引擎（有序执行、整体校验、changedPaths）
+  redact.py      # 叶路径脱敏引擎（字面量/*/** 模式匹配、mask/drop、确定性优先级）
   tree.py        # 叶展开、叶哈希/节点哈希、排序建树、标准与紧凑证明
   pointers.py    # RFC 6901 指针解析与寻址
   canonical.py   # 规范 JSON 序列化
@@ -570,7 +714,7 @@ app/
   validation.py  # 提交值校验（非有限数、非 JSON 类型等）
   openapi.py     # 两种证明格式与 /diff、/patch 的 OpenAPI 模型与文档合并
   errors.py      # 带 code/loc 的 API 错误类型
-tests/           # 哈希/树单元测试 + API 端到端（含全部篡改、去重、结构错误与补丁场景）
+tests/           # 哈希/树单元测试 + API 端到端（含全部篡改、去重、结构错误、补丁与脱敏场景）
 Dockerfile
 docker-entrypoint.sh   # 启动时安装依赖并启动 uvicorn
 docker-compose.yml
