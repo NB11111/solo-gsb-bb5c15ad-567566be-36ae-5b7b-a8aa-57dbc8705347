@@ -284,6 +284,79 @@ class PatchResponse(BaseModel):
     )
 
 
+# ---------------------------------------------------------------------------
+# Deterministic leaf redaction
+# ---------------------------------------------------------------------------
+
+
+class RedactRule(BaseModel):
+    pattern: str = Field(
+        ...,
+        description=(
+            "RFC 6901 fragment selecting leaf paths. Every reference token "
+            "is either a literal name/index (with ~0/~1 escapes), '*' "
+            "matching exactly one token, or '**' matching zero or more "
+            "tokens. The empty fragment '' matches only the root leaf."
+        ),
+    )
+    action: Literal["mask", "drop"] = Field(
+        ...,
+        description=(
+            "`mask` replaces each matched leaf with the fixed `value` "
+            "constant; `drop` removes an object member or sets an array "
+            "element to null. Dropping the root pointer '' is rejected."
+        ),
+    )
+    value: Optional[Any] = Field(
+        None,
+        description=(
+            "Replacement constant for action `mask` (required); may be any "
+            "JSON value, including a nested container. Ignored for `drop`."
+        ),
+    )
+
+
+class RedactRequest(BaseModel):
+    document: Any = Field(..., description="The JSON document to redact.")
+    rules: List[RedactRule] = Field(
+        ...,
+        description=(
+            "Redaction rules evaluated against every RFC 6901 leaf "
+            "(scalars, null and empty containers are leaves). When several "
+            "rules hit one leaf the winner is, in order: the rule with more "
+            "literal tokens, then more '*' tokens over '**', then the "
+            "earlier rule in this array. Patterns are validated up front "
+            "before any leaf is changed."
+        ),
+    )
+
+
+class AppliedRedaction(BaseModel):
+    path: str = Field(
+        ..., description="RFC 6901 pointer of the redacted leaf."
+    )
+    action: Literal["mask", "drop"]
+    ruleIndex: int = Field(
+        ...,
+        ge=0,
+        description="Array index of the rule that won this leaf.",
+    )
+    pattern: str = Field(
+        ..., description="Pattern carried by the winning rule."
+    )
+
+
+class RedactResponse(BaseModel):
+    document: Any = Field(..., description="The redacted JSON document.")
+    applied: List[AppliedRedaction] = Field(
+        ...,
+        description=(
+            "One entry per redacted leaf, sorted by RFC 6901 pointer. "
+            "Leaves no rule matched are omitted."
+        ),
+    )
+
+
 class CompactVerifyResponse(StandardVerifyResponse):
     proofMode: Literal["compact"]
 
@@ -358,6 +431,10 @@ def install_openapi(app: FastAPI) -> None:
                 PatchOperation,
                 PatchRequest,
                 PatchResponse,
+                RedactRule,
+                RedactRequest,
+                AppliedRedaction,
+                RedactResponse,
                 ErrorResponse,
             )
         )
@@ -645,6 +722,86 @@ def install_openapi(app: FastAPI) -> None:
                                     "/role",
                                     "/subject/age",
                                     "/subject/title",
+                                ],
+                            },
+                        ),
+                    },
+                    **error_responses,
+                },
+            }
+        }
+
+        generated["paths"]["/redact"] = {
+            "post": {
+                "summary": "Mask or drop JSON leaves by RFC 6901 patterns",
+                "description": (
+                    "Applies deterministic redaction to a deep copy of "
+                    "`document`. Each rule pattern is an RFC 6901 fragment "
+                    "whose tokens are literals, '*' (exactly one level) or "
+                    "'**' (zero or more levels); action `mask` replaces "
+                    "each matched leaf with a fixed constant while `drop` "
+                    "removes an object member or nulls an array element. "
+                    "The same leaf rules as /commit apply, so scalars, "
+                    "null and empty {} / [] containers are addressable "
+                    "leaves. When several rules hit a leaf the winner is "
+                    "the rule with more literal tokens, then more '*' "
+                    "tokens over '**', then the earlier array entry; the "
+                    "root pointer '' may be masked but not dropped. Every "
+                    "pattern is syntactically validated before the "
+                    "document is touched. The response carries the redacted "
+                    "document plus an `applied` list (path, action, "
+                    "ruleIndex, pattern) sorted by RFC 6901 pointer."
+                ),
+                "operationId": "redact",
+                "requestBody": _json_content(
+                    _ref("RedactRequest"),
+                    example={
+                        "document": {
+                            "subject": {
+                                "name": "Ada",
+                                "age": 36,
+                                "ssn": "078-05-1120",
+                            },
+                            "emails": ["ada@example.com", "ada@x.io"],
+                            "empty": {},
+                        },
+                        "rules": [
+                            {"pattern": "/subject/ssn",
+                             "action": "mask", "value": "***"},
+                            {"pattern": "/emails/*",
+                             "action": "mask", "value": "redacted"},
+                            {"pattern": "/subject/age", "action": "drop"},
+                        ],
+                    },
+                ),
+                "responses": {
+                    "200": {
+                        "description": "Redacted document and path-sorted "
+                        "applied rules.",
+                        **_json_content(
+                            _ref("RedactResponse"),
+                            example={
+                                "document": {
+                                    "subject": {
+                                        "name": "Ada",
+                                        "ssn": "***",
+                                    },
+                                    "emails": ["redacted", "redacted"],
+                                    "empty": {},
+                                },
+                                "applied": [
+                                    {"path": "/emails/0", "action": "mask",
+                                     "ruleIndex": 1,
+                                     "pattern": "/emails/*"},
+                                    {"path": "/emails/1", "action": "mask",
+                                     "ruleIndex": 1,
+                                     "pattern": "/emails/*"},
+                                    {"path": "/subject/age", "action": "drop",
+                                     "ruleIndex": 2,
+                                     "pattern": "/subject/age"},
+                                    {"path": "/subject/ssn", "action": "mask",
+                                     "ruleIndex": 0,
+                                     "pattern": "/subject/ssn"},
                                 ],
                             },
                         ),

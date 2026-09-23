@@ -15,6 +15,10 @@ POST /diff     compare two documents at their RFC 6901 leaf paths and report
 POST /patch    apply an ordered list of RFC 6902 operations (add, remove,
                replace) to a deep copy of a document; returns the patched
                document together with the sorted changed leaf paths.
+POST /redact   deterministically mask or drop JSON leaves selected by RFC
+               6901 fragment patterns (literals, '*' and '**' wildcards);
+               returns the redacted document and the path-sorted applied
+               list, including the rule index and pattern that won each leaf.
 GET  /healthz  liveness probe.
 GET  /         service metadata.
 """
@@ -32,6 +36,7 @@ from . import pointers
 from .canonical import CanonicalError
 from .diff import diff_documents
 from .patch import apply_patch
+from .redact import redact_document
 from .errors import (
     ApiError,
     BAD_HASH_ENCODING,
@@ -78,7 +83,7 @@ _HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
 
 app = FastAPI(
     title="Selective JSON Disclosure",
-    version="1.3.0",
+    version="1.4.0",
     description=(
         "Commit a nested JSON document to a reproducible Merkle root and "
         "disclose individual RFC 6901 leaf facts with inclusion proofs.\n\n"
@@ -473,6 +478,28 @@ async def patch_document_endpoint(request: Request) -> Dict[str, Any]:
     operations = _get_field(body, "operations", "operations")
 
     return apply_patch(document, operations)
+
+
+# ---------------------------------------------------------------------------
+# POST /redact
+# ---------------------------------------------------------------------------
+
+
+@app.post("/redact")
+async def redact_document_endpoint(request: Request) -> Dict[str, Any]:
+    body = await _read_json_body(request)
+    if not isinstance(body, dict):
+        raise ApiError(
+            INVALID_REQUEST,
+            "request body must be a JSON object",
+            loc="body",
+        )
+
+    document = _get_field(body, "document", "document")
+    validate_json_value(document, loc="document")
+    rules = _get_field(body, "rules", "rules")
+
+    return redact_document(document, rules)
 
 
 # ---------------------------------------------------------------------------
@@ -981,12 +1008,13 @@ async def healthz() -> Dict[str, str]:
 async def index() -> Dict[str, Any]:
     return {
         "service": "selective-json-disclosure",
-        "version": "1.3.0",
+        "version": "1.4.0",
         "endpoints": {
             "commit": "POST /commit",
             "verify": "POST /verify",
             "diff": "POST /diff",
             "patch": "POST /patch",
+            "redact": "POST /redact",
             "docs": "GET /docs",
             "health": "GET /healthz",
         },

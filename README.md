@@ -204,6 +204,86 @@ RFC 6901 路径字符串排序并对齐两侧叶子：
 文档时（例如以相同值 `replace`），`changedPaths` 为空数组；`operations` 为空数组
 时原样返回文档且 `changedPaths` 为 `[]`。
 
+### 9. 确定性叶级脱敏（`POST /redact`）
+
+`/redact` 接收一份 `document` 与按数组顺序排列的 `rules`，在文档的**深拷贝**上对每个
+**叶路径**（与 `/commit` 相同的叶模型：标量、`null`、空对象 `{}`、空数组 `[]` 都是叶子，
+因此空容器也可被处理）执行确定性脱敏。每条规则形如
+`{"pattern": "<RFC 6901 片段>", "action": "mask"|"drop", "value"?: ...}`。
+
+**pattern** 是 RFC 6901 指针片段（`~0`/`~1` 转义规则相同），其每个引用记号可以是：
+
+- 字面量（如 `/subject/name`、`/a/0`）；
+- `*`：恰好匹配一层记号（成员名或数组下标均可），不跨层，例如 `/emails/*` 匹配
+  `/emails/0`、`/emails/1`，但不匹配 `/emails` 或 `/emails/0/x`；
+- `**`：匹配**零层或任意多层**记号，例如 `/x/**/name` 同时匹配 `/x/name`（零层）、
+  `/x/y/name` 与 `/x/y/z/name`；`/**` 匹配全部叶路径；
+- 空片段 `""` 是字面量根指针，只匹配根标量/根空容器；
+- 记号内不能把 `*` 与其他字符混用（如 `/a*` 非法，因为 `*` 无法被转义为字面量），
+  非法模式统一返回 `POINTER_SYNTAX`，`loc` 指向 `rules[i]`。
+
+**action**：
+
+| action | 对象成员 | 数组元素 | 要求 |
+| --- | --- | --- | --- |
+| `mask` | 以常量 `value` 整体替换该叶值 | 同左 | 必须携带 `value`，可以是任意 JSON 值（含嵌套容器，经过与其他接口相同的值校验） |
+| `drop` | 删除该成员 | 元素**置为 `null`**（不移动后续元素下标） | 不接受 `value`（多余字段会被忽略） |
+
+根指针 `""` 可以 `mask`（整体替换文档），但不能 `drop`（文档本身没有父槽位），
+命中时返回 `INVALID_REQUEST`，`loc` 指向对应规则。
+
+**同一叶命中多条规则时的胜出顺序是确定性的**：
+
+1. 字面量记号数更多的规则胜出（`*` 与 `**` 都算非字面量）；
+2. 字面量数相同时，`*` 记号数更多者胜出（即 `*` 优先于 `**`）；
+3. 仍相同时，按 `rules` 数组顺序，先出现者胜出。
+
+所有规则的结构与模式语法**先完整校验、再整体生效**：任一条规则非法，整份请求失败，
+响应不含 `document`/`applied`，输入文档不被修改。规则判定针对原始文档形状一次完成，
+因此删除成员或置空数组元素不会影响其他叶的判定。
+
+成功响应为 `{"document": ..., "applied": [...]}`；`applied` 为每个**实际被处理的叶**
+给出一条 `{"path", "action", "ruleIndex", "pattern"}`（`ruleIndex` 是胜出规则的数组
+下标、`pattern` 是其模式原文），并按 RFC 6901 指针字符串排序；未命中任何规则的叶
+原样保留且不出现在 `applied` 中；`rules` 为空数组时原样返回文档、`applied` 为 `[]`。
+
+请求：
+
+```json
+{
+  "document": {
+    "subject": {"name": "Ada", "age": 36, "ssn": "078-05-1120"},
+    "emails": ["ada@example.com", "ada@analytical.engine"],
+    "empty": {}
+  },
+  "rules": [
+    {"pattern": "/subject/ssn", "action": "mask", "value": "***"},
+    {"pattern": "/emails/*", "action": "mask", "value": "redacted"},
+    {"pattern": "/subject/age", "action": "drop"},
+    {"pattern": "/**", "action": "mask", "value": "fallback"}
+  ]
+}
+```
+
+成功（`200`；前两条字面/单层规则优先于兜底的 `/**`，`/subject/name` 才落到 `/**`）：
+
+```json
+{
+  "document": {
+    "subject": {"name": "fallback", "ssn": "***"},
+    "emails": ["redacted", "redacted"],
+    "empty": {}
+  },
+  "applied": [
+    {"path": "/emails/0", "action": "mask", "ruleIndex": 1, "pattern": "/emails/*"},
+    {"path": "/emails/1", "action": "mask", "ruleIndex": 1, "pattern": "/emails/*"},
+    {"path": "/subject/age", "action": "drop", "ruleIndex": 2, "pattern": "/subject/age"},
+    {"path": "/subject/name", "action": "mask", "ruleIndex": 3, "pattern": "/**"},
+    {"path": "/subject/ssn", "action": "mask", "ruleIndex": 0, "pattern": "/subject/ssn"}
+  ]
+}
+```
+
 ## API
 
 所有请求/响应均为 JSON。错误响应统一形如：
@@ -502,6 +582,7 @@ RFC 6901 路径字符串排序并对齐两侧叶子：
 - `GET /healthz` → `{"status":"ok"}`
 - `POST /diff` → 叶级 added/removed/changed 变更报告
 - `POST /patch` → 顺序执行 RFC 6902 add/remove/replace 补丁，返回 patched 文档与 changedPaths
+- `POST /redact` → 按 RFC 6901 片段（字面量/`*`/`**`）确定性 mask/drop 叶路径，返回 redacted 文档与 applied 列表
 - `GET /` → 服务与端点元信息
 - `GET /docs` / `GET /openapi.json` → OpenAPI 文档
 
@@ -546,6 +627,16 @@ curl -s localhost:8000/commit -H 'content-type: application/json' -d '{
 }'
 # /verify 自动识别紧凑格式：把紧凑响应的 root/leafCount/leaves/proofNodes
 # 原样回传即可（无需携带 document 或 proofMode）。
+
+# 6) 确定性脱敏：字面量优先于 *，* 优先于 **；drop 删除对象成员、数组元素置 null
+curl -s localhost:8000/redact -H 'content-type: application/json' -d '{
+  "document": {"subject": {"name": "Ada", "ssn": "078-05-1120"}, "emails": ["a@x", "b@y"]},
+  "rules": [
+    {"pattern": "/subject/ssn", "action": "mask", "value": "***"},
+    {"pattern": "/emails/*", "action": "mask", "value": "redacted"},
+    {"pattern": "/**", "action": "mask", "value": null}
+  ]
+}'
 ```
 
 ## 本地开发与测试（不使用 Docker）
@@ -560,9 +651,10 @@ python3 -m uvicorn app.main:app --reload --port 8000
 
 ```
 app/
-  main.py        # FastAPI 路由：/commit、/verify、/diff、/patch、错误处理
+  main.py        # FastAPI 路由：/commit、/verify、/diff、/patch、/redact、错误处理
   diff.py        # 叶级路径对齐、规范值指纹与 added/removed/changed
   patch.py       # RFC 6902 add/remove/replace 引擎（有序执行、整体校验、changedPaths）
+  redact.py      # 叶级脱敏引擎：RFC 6901 片段（字面量/*/**）匹配、mask/drop、规则优先级
   tree.py        # 叶展开、叶哈希/节点哈希、排序建树、标准与紧凑证明
   pointers.py    # RFC 6901 指针解析与寻址
   canonical.py   # 规范 JSON 序列化
